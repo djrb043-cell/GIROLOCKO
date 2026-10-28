@@ -1,0 +1,56 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+    }
+
+    function hasProfile() {
+      return exists(/databases/$(database)/documents/profiles/$(request.auth.uid));
+    }
+
+    function isAdmin() {
+      return signedIn() && hasProfile()
+        && myProfile().role == 'admin'
+        && myProfile().active == true;
+    }
+
+    function isActiveStore() {
+      return signedIn() && hasProfile()
+        && myProfile().role == 'lojista'
+        && myProfile().active == true;
+    }
+
+    // Perfis: cada um lê o seu; admin lê todos e só pode alterar o campo "active".
+    // Criar perfis é feito apenas pelo servidor (função da Netlify), nunca pelo navegador.
+    match /profiles/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active']);
+      allow create, delete: if false;
+    }
+
+    // Pedidos
+    match /orders/{orderId} {
+      allow read: if signedIn() && (resource.data.store_id == request.auth.uid || isAdmin());
+
+      allow create: if isActiveStore()
+        && request.resource.data.store_id == request.auth.uid
+        && request.resource.data.status == 'pendente'
+        && request.resource.data.payment_method in ['pago_loja', 'receber_loja'];
+
+      // Só o admin muda status / entrega
+      allow update: if isAdmin();
+
+      // Lojista só apaga pedido seu que ainda está pendente
+      allow delete: if isAdmin()
+        || (signedIn() && resource.data.store_id == request.auth.uid && resource.data.status == 'pendente');
+    }
+  }
+}

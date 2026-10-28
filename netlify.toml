@@ -1,0 +1,15 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "22"
+  # Essas chaves "VITE_FIREBASE_*" são públicas por natureza (vão dentro do site).
+  # Sem isto, o scanner de segredos da Netlify pode barrar o deploy.
+  SECRETS_SCAN_OMIT_KEYS = "VITE_FIREBASE_API_KEY,VITE_FIREBASE_AUTH_DOMAIN,VITE_FIREBASE_PROJECT_ID,VITE_FIREBASE_APP_ID"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
