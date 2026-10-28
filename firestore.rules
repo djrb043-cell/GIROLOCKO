@@ -43,14 +43,21 @@ service cloud.firestore {
       allow create: if isActiveStore()
         && request.resource.data.store_id == request.auth.uid
         && request.resource.data.status == 'pendente'
+        && request.resource.data.get('sent_to_giroloc', false) == false
         && request.resource.data.payment_method in ['pago_loja', 'receber_loja'];
 
-      // Só o admin muda status / entrega
-      allow update: if isAdmin();
+      // Admin muda status / coleta / entrega.
+      // A loja só pode marcar o próprio pedido como "lista enviada" (campo sent_to_giroloc).
+      allow update: if isAdmin()
+        || (signedIn() && resource.data.store_id == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['sent_to_giroloc'])
+            && request.resource.data.sent_to_giroloc == true);
 
-      // Lojista só apaga pedido seu que ainda está pendente
+      // Lojista só apaga pedido seu que ainda está pendente e cuja lista não foi enviada
       allow delete: if isAdmin()
-        || (signedIn() && resource.data.store_id == request.auth.uid && resource.data.status == 'pendente');
+        || (signedIn() && resource.data.store_id == request.auth.uid
+            && resource.data.status == 'pendente'
+            && resource.data.get('sent_to_giroloc', false) == false);
     }
   }
 }

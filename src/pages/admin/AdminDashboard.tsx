@@ -1,12 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import {
-  Users, Package, Download, RefreshCw, Plus, Search,
-  MessageCircle, Navigation, CheckCircle2, X, AlertCircle,
-  ChevronDown, Filter, Trash2, PhoneCall
-} from 'lucide-react';
+import { Users, Package, Download, RefreshCw, Plus, Search, MessageCircle, Navigation, CircleCheck as CheckCircle2, X, CircleAlert as AlertCircle, ChevronDown, Filter, Trash2, PhoneCall } from 'lucide-react';
 import Header from '@/components/Header';
 import LoadingSpinner from '@/components/LoadingSpinner';
-import { collection, doc, getDocs, orderBy, query, updateDoc, where, type QueryConstraint } from 'firebase/firestore';
+import { collection, doc, getDocs, orderBy, query, updateDoc } from 'firebase/firestore';
 import { db, Order } from '@/lib/firebase';
 import {
   formatCurrency, PAYMENT_LABELS, STATUS_LABELS, STATUS_COLORS
@@ -14,34 +10,32 @@ import {
 import { useAuth } from '@/contexts/AuthContext';
 import UserManagement from './UserManagement';
 import OrderAnalytics from '@/components/OrderAnalytics';
+import * as XLSX from 'xlsx';
 
 type Tab = 'orders' | 'users';
+type OrderView = 'abertos' | 'historico';
 
 export default function AdminDashboard() {
   const { profile } = useAuth();
   const [tab, setTab] = useState<Tab>('orders');
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filterDate, setFilterDate] = useState<string>(todayISO());
+  const [filterStart, setFilterStart] = useState(`${todayISO()}T00:00`);
+  const [filterEnd, setFilterEnd] = useState(`${todayISO()}T23:59`);
   const [filterStatus, setFilterStatus] = useState('');
   const [search, setSearch] = useState('');
   const [deliveryModal, setDeliveryModal] = useState<Order | null>(null);
   const [receivedBy, setReceivedBy] = useState('');
   const [savingDelivery, setSavingDelivery] = useState(false);
   const [deliveryError, setDeliveryError] = useState('');
+  const [collectingId, setCollectingId] = useState<string | null>(null);
+  const [orderView, setOrderView] = useState<OrderView>('abertos');
+  const [expandedStores, setExpandedStores] = useState<Record<string, boolean>>({});
 
   const fetchOrders = useCallback(async () => {
     setLoading(true);
     try {
-      const constraints: QueryConstraint[] = [];
-      if (filterDate) {
-        constraints.push(
-          where('created_at', '>=', `${filterDate}T00:00:00.000Z`),
-          where('created_at', '<=', `${filterDate}T23:59:59.999Z`),
-        );
-      }
-      constraints.push(orderBy('created_at', 'asc'));
-      const snap = await getDocs(query(collection(db, 'orders'), ...constraints));
+      const snap = await getDocs(query(collection(db, 'orders'), orderBy('created_at', 'asc')));
       let list = snap.docs.map(d => ({ id: d.id, ...d.data() }) as Order);
       // filtro de status feito aqui (evita criar índice composto no Firestore)
       if (filterStatus) list = list.filter(o => o.status === filterStatus);
@@ -50,47 +44,57 @@ export default function AdminDashboard() {
       console.error('Erro ao buscar pedidos:', err);
     }
     setLoading(false);
-  }, [filterDate, filterStatus]);
+  }, [filterStatus]);
 
   useEffect(() => { fetchOrders(); }, [fetchOrders]);
 
-  const filtered = orders.filter(o =>
-    !search ||
-    o.client_name.toLowerCase().includes(search.toLowerCase()) ||
-    o.address.toLowerCase().includes(search.toLowerCase()) ||
-    o.neighborhood.toLowerCase().includes(search.toLowerCase()) ||
-    o.store_name.toLowerCase().includes(search.toLowerCase())
+  const filtered = orders.filter(order => {
+    const matchesSearch = !search ||
+      order.client_name.toLowerCase().includes(search.toLowerCase()) ||
+      order.address.toLowerCase().includes(search.toLowerCase()) ||
+      order.neighborhood.toLowerCase().includes(search.toLowerCase()) ||
+      order.store_name.toLowerCase().includes(search.toLowerCase());
+    const matchesView = orderView === 'abertos' ? !order.delivered_at : Boolean(order.delivered_at);
+    const matchesHistoryDate = orderView === 'abertos' || !order.delivered_at || (order.delivered_at.slice(0, 16) >= filterStart && order.delivered_at.slice(0, 16) <= filterEnd);
+    return matchesSearch && matchesView && matchesHistoryDate;
+  });
+
+  const storeGroups = Array.from(
+    filtered.reduce((groups, order) => {
+      const group = groups.get(order.store_id) ?? [];
+      group.push(order);
+      groups.set(order.store_id, group);
+      return groups;
+    }, new Map<string, Order[]>()).entries()
   );
 
-  function exportCSV() {
-    const header = [
-      'Numero do Pedido',
-      'Nome da Loja',
-      'Endereço',
-      'Complemento',
-      'Bairro',
-      'Cidade',
-      'Estado',
+  function exportXLSX() {
+    const rows = filtered.map((order, index) => ({
+      Pedido: `Pedido ${index + 1}`,
+      Nome: order.client_name,
+      Endereço: order.address,
+      Estado: 'Santa Catarina',
+      Cidade: order.city,
+      Bairro: order.neighborhood,
+      Complemento: order.notes ?? '',
+      Whatsapp: order.client_whatsapp,
+    }));
+    const worksheet = XLSX.utils.json_to_sheet(rows, {
+      header: ['Pedido', 'Nome', 'Endereço', 'Estado', 'Cidade', 'Bairro', 'Complemento', 'Whatsapp'],
+    });
+    worksheet['!cols'] = [
+      { wch: 14 },
+      { wch: 28 },
+      { wch: 42 },
+      { wch: 18 },
+      { wch: 28 },
+      { wch: 28 },
+      { wch: 32 },
+      { wch: 18 },
     ];
-    const rows = filtered.map(o => [
-      o.id.slice(0, 8),
-      o.store_name,
-      o.address,
-      o.notes ?? '',
-      o.neighborhood,
-      o.city,
-      'Santa Catarina',
-    ]);
-    const csv = [header, ...rows]
-      .map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(';'))
-      .join('\r\n');
-    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `giroloc-${filterDate || 'todos'}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Pedidos');
+    XLSX.writeFile(workbook, `giroloc-${filterStart.slice(0, 10) || 'todos'}.xlsx`);
   }
 
   function whatsappLink(order: Order) {
@@ -123,9 +127,10 @@ export default function AdminDashboard() {
       return;
     }
     setSavingDelivery(true);
+    const deliveredAt = new Date().toISOString();
     let error: unknown = null;
     try {
-      await updateDoc(doc(db, 'orders', deliveryModal.id), { status: 'entregue', received_by: receivedBy.trim() });
+      await updateDoc(doc(db, 'orders', deliveryModal.id), { status: 'entregue', received_by: receivedBy.trim(), delivered_at: deliveredAt });
     } catch (err) {
       console.error(err);
       error = err;
@@ -135,18 +140,57 @@ export default function AdminDashboard() {
       setDeliveryError('Erro ao salvar. Tente novamente.');
       return;
     }
-    setOrders(prev => prev.map(o => o.id === deliveryModal.id ? { ...o, status: 'entregue', received_by: receivedBy } : o));
+    setOrders(prev => prev.map(o => o.id === deliveryModal.id ? { ...o, status: 'entregue', received_by: receivedBy.trim(), delivered_at: deliveredAt } : o));
     setDeliveryModal(null);
   }
 
   async function updateStatus(orderId: string, status: Order['status']) {
+    const currentOrder = orders.find(order => order.id === orderId);
+    const deliveredAt = status === 'entregue' ? (currentOrder?.delivered_at ?? new Date().toISOString()) : null;
+    const receivedBy = status === 'entregue' ? currentOrder?.received_by ?? null : null;
     try {
-      await updateDoc(doc(db, 'orders', orderId), { status });
-      setOrders(prev => prev.map(o => o.id === orderId ? { ...o, status } : o));
+      await updateDoc(doc(db, 'orders', orderId), { status, delivered_at: deliveredAt, received_by: receivedBy });
     } catch (err) {
       console.error('Erro ao atualizar status:', err);
-      alert('Não foi possível atualizar o status.');
+      return;
     }
+    setOrders(prev => prev.map(order => order.id === orderId ? { ...order, status, delivered_at: deliveredAt, received_by: receivedBy } : order));
+  }
+
+  async function collectOrder(orderId: string) {
+    setCollectingId(orderId);
+    const collectedAt = new Date().toISOString();
+    const collectedBy = profile?.email ?? 'GiroLoc';
+    const target = orders.find(order => order.id === orderId);
+    if (!target || !target.sent_to_giroloc || target.collected_at) {
+      setCollectingId(null);
+      return;
+    }
+    try {
+      await updateDoc(doc(db, 'orders', orderId), { collected_at: collectedAt, collected_by: collectedBy });
+    } catch (err) {
+      console.error('Erro ao confirmar coleta:', err);
+      setCollectingId(null);
+      return;
+    }
+    setCollectingId(null);
+    setOrders(prev => prev.map(order => order.id === orderId
+      ? { ...order, collected_at: collectedAt, collected_by: collectedBy }
+      : order
+    ));
+  }
+
+  async function undoDelivery(orderId: string) {
+    try {
+      await updateDoc(doc(db, 'orders', orderId), { status: 'em_rota', received_by: null, delivered_at: null });
+    } catch (err) {
+      console.error('Erro ao desfazer entrega:', err);
+      return;
+    }
+    setOrders(prev => prev.map(order => order.id === orderId
+      ? { ...order, status: 'em_rota', received_by: null, delivered_at: null }
+      : order
+    ));
   }
 
   const summary = {
@@ -226,17 +270,32 @@ export default function AdminDashboard() {
               <OrderAnalytics orders={filtered} title="Visão Geral de Entregas" />
             </div>
 
+            <div className="flex gap-1 mb-4 bg-white dark:bg-gray-900 p-1 rounded-xl border border-gray-200 dark:border-gray-800 w-fit">
+              {([['abertos', 'Pedidos em aberto'], ['historico', 'Histórico de entregas']] as const).map(([view, label]) => (
+                <button key={view} onClick={() => setOrderView(view)} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${orderView === view ? 'bg-purple-700 text-white shadow' : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
             {/* Filters */}
             <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-4 mb-4 flex flex-wrap gap-3">
-              <div className="flex items-center gap-2 flex-1 min-w-48">
+              {orderView === 'historico' && <div className="flex items-center gap-2 flex-1 min-w-48">
                 <Filter size={16} className="text-gray-400 shrink-0" />
                 <input
-                  type="date"
-                  value={filterDate}
-                  onChange={e => setFilterDate(e.target.value)}
+                  type="datetime-local"
+                  value={filterStart}
+                  onChange={e => setFilterStart(e.target.value)}
                   className="flex-1 text-sm border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-700"
                 />
-              </div>
+                <span className="text-xs text-gray-400">até</span>
+                <input
+                  type="datetime-local"
+                  value={filterEnd}
+                  onChange={e => setFilterEnd(e.target.value)}
+                  className="flex-1 text-sm border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-700"
+                />
+              </div>}
               <select
                 value={filterStatus}
                 onChange={e => setFilterStatus(e.target.value)}
@@ -259,32 +318,52 @@ export default function AdminDashboard() {
                 <RefreshCw size={15} />
                 Atualizar
               </button>
-              <button onClick={exportCSV} className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg bg-purple-700 hover:bg-purple-600 text-white transition">
+              <button onClick={exportXLSX} className="flex items-center gap-1.5 text-sm px-3 py-2 rounded-lg bg-purple-700 hover:bg-purple-600 text-white transition">
                 <Download size={15} />
                 Exportar XLSX
               </button>
             </div>
 
             {/* Orders list */}
-            {loading ? <LoadingSpinner /> : filtered.length === 0 ? (
+            {loading ? <LoadingSpinner /> : storeGroups.length === 0 ? (
               <div className="text-center py-16 text-gray-400 dark:text-gray-600">
                 <Package size={48} className="mx-auto mb-3 opacity-30" />
                 <p className="text-lg font-medium">Nenhum pedido encontrado</p>
                 <p className="text-sm mt-1">Ajuste os filtros acima.</p>
               </div>
             ) : (
-              <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filtered.map(order => (
-                  <OrderCard
-                    key={order.id}
-                    order={order}
-                    onDeliveryCheck={() => openDeliveryModal(order)}
-                    onStatusChange={updateStatus}
-                    whatsappLink={whatsappLink(order)}
-                    mapsLink={mapsLink(order)}
-                    wazeLink={wazeLink(order)}
-                  />
-                ))}
+              <div className="flex flex-col gap-3">
+                {storeGroups.map(([storeId, storeOrders]) => {
+                  const expanded = expandedStores[storeId] ?? false;
+                  return (
+                    <section key={storeId} className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden">
+                      <button onClick={() => setExpandedStores(previous => ({ ...previous, [storeId]: !expanded }))} className="w-full flex items-center justify-between gap-3 px-5 py-4 text-left hover:bg-gray-50 dark:hover:bg-gray-800/50 transition">
+                        <div>
+                          <p className="font-semibold text-gray-900 dark:text-white">{storeOrders[0].store_name}</p>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{storeOrders.length} pedido(s)</p>
+                        </div>
+                        <ChevronDown size={18} className={`text-gray-400 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+                      </button>
+                      {expanded && <div className="p-4 border-t border-gray-100 dark:border-gray-800 grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {storeOrders.map(order => (
+                          <OrderCard
+                            key={order.id}
+                            order={order}
+                            isHistory={orderView === 'historico'}
+                            onDeliveryCheck={() => openDeliveryModal(order)}
+                            onUndoDelivery={() => undoDelivery(order.id)}
+                            onStatusChange={updateStatus}
+                            onCollect={() => collectOrder(order.id)}
+                            collecting={collectingId === order.id}
+                            whatsappLink={whatsappLink(order)}
+                            mapsLink={mapsLink(order)}
+                            wazeLink={wazeLink(order)}
+                          />
+                        ))}
+                      </div>}
+                    </section>
+                  );
+                })}
               </div>
             )}
           </>
@@ -351,12 +430,16 @@ interface OrderCardProps {
   order: Order;
   onDeliveryCheck: () => void;
   onStatusChange: (id: string, status: Order['status']) => void;
+  onCollect: () => void;
+  isHistory: boolean;
+  onUndoDelivery: () => void;
+  collecting: boolean;
   whatsappLink: string;
   mapsLink: string;
   wazeLink: string;
 }
 
-function OrderCard({ order, onDeliveryCheck, onStatusChange, whatsappLink, mapsLink, wazeLink }: OrderCardProps) {
+function OrderCard({ order, isHistory, onDeliveryCheck, onUndoDelivery, onStatusChange, onCollect, collecting, whatsappLink, mapsLink, wazeLink }: OrderCardProps) {
   const [showStatus, setShowStatus] = useState(false);
   const timeStr = new Date(order.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
 
@@ -394,6 +477,11 @@ function OrderCard({ order, onDeliveryCheck, onStatusChange, whatsappLink, mapsL
             <CheckCircle2 size={12} /> Recebido por: {order.received_by}
           </p>
         )}
+        {order.collected_at && (
+          <p className="text-xs text-orange-700 dark:text-orange-300 flex items-center gap-1">
+            <Package size={12} /> Coletado{order.collected_by ? ` por ${order.collected_by}` : ''}
+          </p>
+        )}
       </div>
 
       {/* Actions */}
@@ -422,12 +510,26 @@ function OrderCard({ order, onDeliveryCheck, onStatusChange, whatsappLink, mapsL
         >
           <Navigation size={14} /> Waze
         </a>
-        {order.status !== 'entregue' && (
+        {!isHistory && order.sent_to_giroloc && !order.collected_at && (
+          <button
+            onClick={onCollect}
+            disabled={collecting}
+            className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-orange-50 dark:bg-orange-900/20 text-orange-700 dark:text-orange-300 hover:bg-orange-100 dark:hover:bg-orange-900/40 disabled:opacity-60 transition border border-orange-200 dark:border-orange-800 font-medium"
+          >
+            <Package size={14} /> {collecting ? 'Coletando loja…' : 'Coletar pedidos da loja'}
+          </button>
+        )}
+        {!isHistory && order.status !== 'entregue' && (
           <button
             onClick={onDeliveryCheck}
             className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-purple-50 dark:bg-purple-900/20 text-purple-700 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/40 transition border border-purple-200 dark:border-purple-800 font-medium"
           >
             <CheckCircle2 size={14} /> Entregue
+          </button>
+        )}
+        {isHistory && (
+          <button onClick={onUndoDelivery} className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 text-yellow-700 dark:text-yellow-300 hover:bg-yellow-100 dark:hover:bg-yellow-900/40 transition border border-yellow-200 dark:border-yellow-800 font-medium">
+            Desfazer entrega
           </button>
         )}
         {/* Quick status dropdown */}

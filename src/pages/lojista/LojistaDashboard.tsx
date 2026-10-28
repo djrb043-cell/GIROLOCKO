@@ -1,12 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Package, Table2, RefreshCw, MessageSquare, Trash2, MessageCircle, Filter, Calendar, ClipboardList } from 'lucide-react';
+import { Package, Table2, RefreshCw, MessageSquare, Trash2, MessageCircle, Filter, Calendar, ClipboardList, CircleCheck as CheckCircle2 } from 'lucide-react';
 import Header from '@/components/Header';
 import CutoffBanner from '@/components/CutoffBanner';
 import PriceTableModal from '@/components/PriceTableModal';
 import OrderForm from './OrderForm';
 import LoadingSpinner from '@/components/LoadingSpinner';
-import OrderAnalytics from '@/components/OrderAnalytics';
-import { collection, deleteDoc, doc, getDocs, query, where } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDocs, query, where, writeBatch } from 'firebase/firestore';
 import { db, Order } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
 import { formatCurrency, PAYMENT_LABELS, STATUS_LABELS, STATUS_COLORS } from '@/lib/pricing';
@@ -28,26 +27,22 @@ export default function LojistaDashboard() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [filterDateStart, setFilterDateStart] = useState(todayISO());
   const [filterDateEnd, setFilterDateEnd] = useState(todayISO());
+  const [sendFeedback, setSendFeedback] = useState('');
 
   const fetchOrders = useCallback(async () => {
     if (!user) return;
     setLoading(true);
-    const today = todayISO();
-    const start = tab === 'hoje' ? today : filterDateStart;
-    const end = tab === 'hoje' ? today : filterDateEnd;
     try {
-      // Busca só pelos pedidos desta loja; o filtro de datas é feito aqui (evita criar índice no Firestore)
       const snap = await getDocs(query(collection(db, 'orders'), where('store_id', '==', user.uid)));
       const list = snap.docs
         .map(d => ({ id: d.id, ...d.data() }) as Order)
-        .filter(o => (!start || o.created_at >= `${start}T00:00:00.000Z`) && (!end || o.created_at <= `${end}T23:59:59.999Z`))
         .sort((a, b) => a.created_at.localeCompare(b.created_at));
       setOrders(list);
     } catch (err) {
       console.error('Erro ao buscar pedidos:', err);
     }
     setLoading(false);
-  }, [user, tab, filterDateStart, filterDateEnd]);
+  }, [user]);
 
   useEffect(() => { fetchOrders(); }, [fetchOrders]);
 
@@ -64,21 +59,41 @@ export default function LojistaDashboard() {
     setDeletingId(null);
   }
 
-  function sendToAdmin() {
-    if (orders.length === 0) return;
+  async function sendToAdmin() {
+    if (openOrders.length === 0) return;
+    setSendFeedback('');
     const dateLabel = tab === 'hoje'
       ? new Date(`${todayISO()}T12:00:00`).toLocaleDateString('pt-BR')
       : filterDateStart === filterDateEnd
         ? new Date(`${filterDateStart}T12:00:00`).toLocaleDateString('pt-BR')
         : `${new Date(`${filterDateStart}T12:00:00`).toLocaleDateString('pt-BR')} - ${new Date(`${filterDateEnd}T12:00:00`).toLocaleDateString('pt-BR')}`;
     const storeName = profile?.store_name ?? 'Loja';
-    const lines = orders.map((o, i) => {
+    const lines = openOrders.map((o, i) => {
       const fee = o.fee != null ? formatCurrency(o.fee) : 'A consultar';
-      return `\u{1F4E6} Pedido ${i + 1}: ${o.client_name}\n\u{1F4CD} ${o.address}\n\u{1F3D9}\uFE0F ${o.neighborhood} \u2014 ${o.city}\n\u{1F4B0} Taxa: ${fee} | ${PAYMENT_LABELS[o.payment_method] ?? o.payment_method}\n\u{1F6F5} Contato: ${o.client_whatsapp}${o.notes ? `\n\u{1F4DD} ${o.notes}` : ''}`;
+      return `Pedido ${i + 1}: ${o.client_name}\n${o.address}\n${o.neighborhood} — ${o.city}\nTaxa: ${fee} | ${PAYMENT_LABELS[o.payment_method] ?? o.payment_method}\nContato: ${o.client_whatsapp}${o.notes ? `\n${o.notes}` : ''}`;
     }).join('\n\n');
-    const total = orders.reduce((s, o) => s + (o.fee ?? 0), 0);
-    const text = `\u{1F6F5} *LISTA DE PEDIDOS \u2014 ${storeName}*\n\u{1F4C5} ${dateLabel}\n${'\u2500'.repeat(30)}\n\n${lines}\n\n${'\u2500'.repeat(30)}\n\u{1F4E6} Total: ${orders.length} pedido(s)\n\u{1F4B5} Total taxas: ${formatCurrency(total)}`;
-    window.open(`https://wa.me/${ADMIN_WHATSAPP}?text=${encodeURIComponent(text)}`, '_blank');
+    const total = openOrders.reduce((s, o) => s + (o.fee ?? 0), 0);
+    const text = `LISTA DE PEDIDOS — ${storeName}\n${dateLabel}\n${'─'.repeat(30)}\n\n${lines}\n\n${'─'.repeat(30)}\nTotal: ${openOrders.length} pedido(s)\nTotal taxas: ${formatCurrency(total)}`;
+    const whatsappWindow = window.open(`https://wa.me/${ADMIN_WHATSAPP}?text=${encodeURIComponent(text)}`, '_blank');
+    let error: unknown = null;
+    try {
+      const batch = writeBatch(db);
+      openOrders.forEach(order => batch.update(doc(db, 'orders', order.id), { sent_to_giroloc: true }));
+      await batch.commit();
+    } catch (err) {
+      console.error(err);
+      error = err;
+    }
+    if (error) {
+      setSendFeedback('A lista foi aberta no WhatsApp, mas não conseguimos registrar o envio. Atualize e tente novamente.');
+      whatsappWindow?.close();
+      return;
+    }
+    setOrders(previous => previous.map(order => openOrders.some(openOrder => openOrder.id === order.id)
+      ? { ...order, sent_to_giroloc: true }
+      : order
+    ));
+    setSendFeedback('Lista enviada! Ela ficará aberta até a GiroLoc confirmar a coleta.');
   }
 
   function contactDriver() {
@@ -86,8 +101,14 @@ export default function LojistaDashboard() {
     window.open(`https://wa.me/${ADMIN_WHATSAPP}?text=${msg}`, '_blank');
   }
 
-  const pendingCount = orders.filter(o => o.status === 'pendente').length;
-  const totalFee = orders.reduce((s, o) => s + (o.fee ?? 0), 0);
+  const openOrders = orders.filter(order => !order.collected_at);
+  const closedOrders = orders.filter(order => Boolean(order.collected_at) && !order.delivered_at);
+  const historyOrders = orders.filter(order => {
+    if (!order.delivered_at) return false;
+    const deliveredDate = order.delivered_at.slice(0, 10);
+    return deliveredDate >= filterDateStart && deliveredDate <= filterDateEnd;
+  });
+  const visibleOrders = tab === 'historico' ? historyOrders : openOrders;
 
   return (
     <div className="min-h-screen bg-purple-50 dark:bg-gray-950 transition-colors duration-300">
@@ -111,7 +132,7 @@ export default function LojistaDashboard() {
         {/* Tabs */}
         <div className="flex gap-1 bg-white dark:bg-gray-900 p-1 rounded-xl border border-gray-200 dark:border-gray-800 w-fit shadow-sm">
           {([
-            ['hoje', 'Pedidos de Hoje', ClipboardList],
+            ['hoje', 'Pedidos de Hoje (aberto)', ClipboardList],
             ['historico', 'Histórico', Calendar],
           ] as const).map(([t, label, Icon]) => (
             <button
@@ -131,19 +152,26 @@ export default function LojistaDashboard() {
 
         {tab === 'hoje' && <CutoffBanner />}
 
-        {/* Summary cards */}
-        <div className="grid grid-cols-3 gap-3">
-          {[
-            { label: 'Pedidos', value: orders.length, color: 'text-purple-700 dark:text-purple-300' },
-            { label: 'Pendentes', value: pendingCount, color: 'text-yellow-700 dark:text-yellow-400' },
-            { label: 'Total Taxas', value: formatCurrency(totalFee), color: 'text-green-700 dark:text-green-400', sm: true },
-          ].map(c => (
-            <div key={c.label} className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-3.5 transition-colors duration-300">
-              <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">{c.label}</p>
-              <p className={`font-bold ${c.color} ${c.sm ? 'text-base' : 'text-2xl'}`}>{c.value}</p>
+        <section className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-purple-950 via-purple-800 to-[#16002f] px-6 py-7 sm:px-8 sm:py-8 text-white shadow-xl shadow-purple-950/20">
+          <div className="absolute -right-16 -top-20 h-56 w-56 rounded-full bg-purple-500/25 blur-3xl" />
+          <div className="absolute -bottom-24 left-1/3 h-48 w-48 rounded-full bg-fuchsia-500/15 blur-3xl" />
+          <div className="relative flex flex-col gap-7 sm:flex-row sm:items-center sm:justify-between">
+            <div className="max-w-xl">
+              <p className="text-xs font-bold uppercase tracking-[0.24em] text-purple-200">Painel de entregas</p>
+              <h2 className="mt-3 text-2xl font-extrabold leading-tight sm:text-3xl">
+                Tudo que gira com a <span className="text-purple-300">GiroLoc</span>
+              </h2>
+              <p className="mt-2 text-sm leading-relaxed text-purple-100/80">Acompanhe o volume total das suas entregas em um só lugar.</p>
             </div>
-          ))}
-        </div>
+            <div className="flex shrink-0 items-center justify-center rounded-2xl bg-white px-5 py-3 shadow-lg shadow-black/20">
+              <img src="/assets/Logo_GiroLoc_com_Emblema_de_Movimento copy.png" alt="GiroLoc" className="h-12 w-auto object-contain sm:h-14" />
+            </div>
+          </div>
+          <div className="relative mt-7 flex items-center justify-center gap-4 border-t border-white/15 pt-5 text-center">
+            <p className="text-5xl font-black tracking-tight text-white sm:text-6xl">{orders.length}</p>
+            <p className="pb-1 text-sm font-semibold uppercase tracking-[0.16em] text-purple-200">total de pacotes<br />em todo o período</p>
+          </div>
+        </section>
 
         {tab === 'hoje' && <OrderForm onCreated={fetchOrders} />}
 
@@ -153,9 +181,9 @@ export default function LojistaDashboard() {
             <div className="flex items-center gap-2">
               <Package size={17} className="text-purple-700 dark:text-purple-300" />
               <h3 className="font-semibold text-gray-900 dark:text-white text-sm">
-                {tab === 'hoje' ? 'Pedidos de Hoje' : 'Histórico de Pedidos'}
+                {tab === 'hoje' ? 'Pedidos de Hoje (aberto)' : 'Histórico de Pedidos'}
               </h3>
-              <span className="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-2 py-0.5 rounded-full">{orders.length}</span>
+              <span className="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 px-2 py-0.5 rounded-full">{visibleOrders.length}</span>
             </div>
             {tab === 'historico' ? (
               <div className="flex items-center gap-2">
@@ -166,59 +194,93 @@ export default function LojistaDashboard() {
                 <button onClick={fetchOrders} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 transition"><RefreshCw size={14} /></button>
               </div>
             ) : (
-              <button onClick={fetchOrders} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 transition"><RefreshCw size={14} /></button>
+              <button onClick={fetchOrders} className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-800 transition"><RefreshCw size={14} /></button>
             )}
           </div>
-          {loading ? <LoadingSpinner /> : orders.length === 0 ? (
-            <div className="text-center py-12 text-gray-400 dark:text-gray-600">
-              <Package size={40} className="mx-auto mb-3 opacity-30" />
-              <p className="text-sm font-medium">{tab === 'hoje' ? 'Nenhum pedido hoje ainda.' : 'Nenhum pedido neste período.'}</p>
-              {tab === 'hoje' && <p className="text-xs mt-1">Use o formulário acima para cadastrar.</p>}
-            </div>
+          {loading ? <LoadingSpinner /> : tab === 'historico' ? (
+            historyOrders.length === 0 ? <EmptyOrders message="Nenhuma entrega neste período." /> : <OrderRows orders={historyOrders} onDelete={deleteOrder} deletingId={deletingId} showDelete={false} />
           ) : (
-            <div className="divide-y divide-gray-100 dark:divide-gray-800">
-              {orders.map((order, i) => (
-                <div key={order.id} className="px-5 py-4 flex items-start gap-3 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition">
-                  <span className="shrink-0 w-6 h-6 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 text-xs font-bold flex items-center justify-center mt-0.5">{i + 1}</span>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-start justify-between gap-2 mb-0.5">
-                      <p className="font-semibold text-gray-900 dark:text-white text-sm truncate">{order.client_name}</p>
-                      <span className={`shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[order.status]}`}>{STATUS_LABELS[order.status]}</span>
-                    </div>
-                    <p className="text-xs text-gray-500 dark:text-gray-400 truncate mb-1">{order.address}</p>
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
-                      <span className="text-gray-400 dark:text-gray-500">{order.neighborhood} · {order.city}</span>
-                      <span className="font-medium text-purple-700 dark:text-purple-300">{order.fee != null ? formatCurrency(order.fee) : 'A consultar'}</span>
-                      <span className="text-gray-400">{PAYMENT_LABELS[order.payment_method] ?? order.payment_method}</span>
-                    </div>
-                    {order.notes && <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 italic">{order.notes}</p>}
-                  </div>
-                  {tab === 'hoje' && (
-                    <button onClick={() => deleteOrder(order.id)} disabled={deletingId === order.id || order.status !== 'pendente'} title={order.status !== 'pendente' ? 'Apenas pedidos pendentes podem ser removidos' : 'Remover pedido'} className="shrink-0 p-1.5 rounded-lg text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-30 disabled:cursor-not-allowed transition">
-                      <Trash2 size={15} />
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
+            openOrders.length === 0 ? <EmptyOrders message="Nenhum pedido aberto hoje." hint="Cadastre um pedido ou confira os pedidos fechados abaixo." /> : <OrderRows orders={openOrders} onDelete={deleteOrder} deletingId={deletingId} showDelete />
           )}
         </div>
 
-        {tab === 'hoje' && orders.length > 0 && (
+        {tab === 'hoje' && closedOrders.length > 0 && (
+          <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden transition-colors duration-300">
+            <div className="px-5 py-4 border-b border-gray-100 dark:border-gray-800 flex items-center gap-2">
+              <CheckCircle2 size={17} className="text-green-600 dark:text-green-400" />
+              <h3 className="font-semibold text-gray-900 dark:text-white text-sm">Pedidos de Hoje (Fechados)</h3>
+              <span className="text-xs bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">{closedOrders.length}</span>
+            </div>
+            <OrderRows orders={closedOrders} onDelete={deleteOrder} deletingId={deletingId} showDelete={false} />
+          </div>
+        )}
+
+        {tab === 'hoje' && openOrders.length > 0 && (
           <div className="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl p-4 flex flex-col sm:flex-row items-start sm:items-center gap-4 transition-colors duration-300">
             <div className="flex-1">
               <p className="font-semibold text-green-800 dark:text-green-300 text-sm">Pronto para fechar o caixa?</p>
-              <p className="text-xs text-green-700 dark:text-green-400 mt-0.5">Envie a lista dos {orders.length} pedido(s) para a GiroLoc pelo WhatsApp.</p>
+              <p className="text-xs text-green-700 dark:text-green-400 mt-0.5">Envie a lista dos {openOrders.length} pedido(s) abertos para a GiroLoc pelo WhatsApp.</p>
+              {sendFeedback && <p className="text-xs font-semibold text-green-800 dark:text-green-300 mt-2">{sendFeedback}</p>}
             </div>
-            <button onClick={sendToAdmin} className="flex items-center gap-2 px-5 py-3 rounded-xl bg-green-600 hover:bg-green-500 text-white font-semibold text-sm transition-all shadow-md whitespace-nowrap">
-              <MessageSquare size={17} /> Enviar Lista para GiroLoc
+            <button onClick={sendToAdmin} disabled={openOrders.every(order => order.sent_to_giroloc)} className="flex items-center gap-2 px-5 py-3 rounded-xl bg-green-600 hover:bg-green-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold text-sm transition-all shadow-md whitespace-nowrap">
+              <MessageSquare size={17} /> {openOrders.every(order => order.sent_to_giroloc) ? 'Lista enviada!' : 'Enviar Lista para GiroLoc'}
             </button>
           </div>
         )}
 
-        {tab === 'historico' && <OrderAnalytics orders={orders} title="Seus pedidos no período" />}
+
       </div>
       {showPriceTable && <PriceTableModal onClose={() => setShowPriceTable(false)} />}
+    </div>
+  );
+}
+
+interface OrderRowsProps {
+  orders: Order[];
+  onDelete: (id: string) => void;
+  deletingId: string | null;
+  showDelete: boolean;
+}
+
+function OrderRows({ orders, onDelete, deletingId, showDelete }: OrderRowsProps) {
+  return (
+    <div className="divide-y divide-gray-100 dark:divide-gray-800">
+      {orders.map((order, index) => (
+        <div key={order.id} className="px-5 py-4 flex items-start gap-3 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition">
+          <span className="shrink-0 w-6 h-6 rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 text-xs font-bold flex items-center justify-center mt-0.5">{index + 1}</span>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-start justify-between gap-2 mb-0.5">
+              <p className="font-semibold text-gray-900 dark:text-white text-sm truncate">{order.client_name}</p>
+              <span className={`shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[order.status]}`}>{STATUS_LABELS[order.status]}</span>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400 truncate mb-1">{order.address}</p>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
+              <span className="text-gray-400 dark:text-gray-500">{order.neighborhood} · {order.city}</span>
+              <span className="font-medium text-purple-700 dark:text-purple-300">{order.fee != null ? formatCurrency(order.fee) : 'A consultar'}</span>
+              <span className="text-gray-400">{PAYMENT_LABELS[order.payment_method] ?? order.payment_method}</span>
+            </div>
+            {order.notes && <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 italic">{order.notes}</p>}
+            {order.sent_to_giroloc && <p className="text-xs text-green-700 dark:text-green-400 mt-1 font-medium">Lista enviada!</p>}
+            {order.delivered_at && <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Entregue em: {new Date(order.delivered_at).toLocaleString('pt-BR')}</p>}
+            {order.received_by && <p className="text-xs text-blue-700 dark:text-blue-400 mt-1">Recebido por: {order.received_by}</p>}
+          </div>
+          {showDelete && (
+            <button onClick={() => onDelete(order.id)} disabled={deletingId === order.id || order.status !== 'pendente' || order.sent_to_giroloc} title={order.sent_to_giroloc ? 'Pedidos enviados não podem ser removidos' : order.status !== 'pendente' ? 'Apenas pedidos pendentes podem ser removidos' : 'Remover pedido'} className="shrink-0 p-1.5 rounded-lg text-gray-300 dark:text-gray-600 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-30 disabled:cursor-not-allowed transition">
+              <Trash2 size={15} />
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EmptyOrders({ message, hint }: { message: string; hint?: string }) {
+  return (
+    <div className="text-center py-12 text-gray-400 dark:text-gray-600">
+      <Package size={40} className="mx-auto mb-3 opacity-30" />
+      <p className="text-sm font-medium">{message}</p>
+      {hint && <p className="text-xs mt-1">{hint}</p>}
     </div>
   );
 }

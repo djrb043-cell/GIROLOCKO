@@ -49,4 +49,8 @@ export interface Order {
   floripa_distance_km: number | null;
   notes: string | null;
   created_at: string;
+  sent_to_giroloc: boolean;
+  collected_at: string | null;
+  collected_by: string | null;
+  delivered_at: string | null;
 }

@@ -1,9 +1,9 @@
 import { useState, FormEvent, type ReactNode } from 'react';
-import { Plus, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Plus, CircleAlert as AlertCircle, CircleCheck as CheckCircle2 } from 'lucide-react';
 import { addDoc, collection } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
-import { CITIES, City, neighborhoods, formatCurrency } from '@/lib/pricing';
+import { CITIES, City, neighborhoods, formatCurrency, FREE_TEXT_CITIES } from '@/lib/pricing';
 
 const PAYMENT_OPTIONS = [
   { value: 'pago_loja', label: 'Pago na Loja' },
@@ -31,10 +31,13 @@ export default function OrderForm({ onCreated }: OrderFormProps) {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
-  const cityNeighborhoods = form.city
+  const isFreeTextCity = form.city ? form.city in FREE_TEXT_CITIES : false;
+  const cityNeighborhoods = form.city && !isFreeTextCity
     ? neighborhoods.filter(neighborhood => neighborhood.city === form.city)
     : [];
-  const selectedNeighborhood = cityNeighborhoods.find(neighborhood => neighborhood.label === form.neighborhood);
+  const selectedNeighborhood = isFreeTextCity
+    ? { label: form.neighborhood, fee: FREE_TEXT_CITIES[form.city] ?? null }
+    : cityNeighborhoods.find(neighborhood => neighborhood.label === form.neighborhood);
 
   function setField<Key extends keyof typeof empty>(key: Key, value: (typeof empty)[Key]) {
     setForm(previous => ({ ...previous, [key]: value }));
@@ -58,7 +61,8 @@ export default function OrderForm({ onCreated }: OrderFormProps) {
     if (!form.client_whatsapp.trim()) { setError('Informe o WhatsApp do cliente.'); return; }
     if (!form.address.trim()) { setError('Informe o endereço completo.'); return; }
     if (!form.city) { setError('Selecione a cidade de entrega.'); return; }
-    if (!selectedNeighborhood) { setError('Selecione o bairro de entrega.'); return; }
+    if (!form.neighborhood.trim()) { setError('Informe o bairro de entrega.'); return; }
+    if (!isFreeTextCity && !selectedNeighborhood) { setError('Selecione o bairro de entrega.'); return; }
 
     setSubmitting(true);
     let dbError: { message: string } | null = null;
@@ -69,14 +73,18 @@ export default function OrderForm({ onCreated }: OrderFormProps) {
       client_name: form.client_name.trim(),
       client_whatsapp: form.client_whatsapp.trim(),
       address: form.address.trim(),
-      neighborhood: selectedNeighborhood.label,
+      neighborhood: form.neighborhood.trim(),
       city: form.city,
-      fee: selectedNeighborhood.fee,
+      fee: isFreeTextCity ? (FREE_TEXT_CITIES[form.city] ?? null) : (selectedNeighborhood?.fee ?? null),
       payment_method: form.payment_method,
       floripa_distance_km: null,
       notes: form.notes.trim() || null,
       status: 'pendente',
       received_by: null,
+      sent_to_giroloc: false,
+      collected_at: null,
+      collected_by: null,
+      delivered_at: null,
       created_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -129,10 +137,14 @@ export default function OrderForm({ onCreated }: OrderFormProps) {
           </select>
         </Field>
         <Field label="Bairro">
-          <select required disabled={!form.city} value={form.neighborhood} onChange={event => setField('neighborhood', event.target.value)} className={`${inputClass} disabled:cursor-not-allowed disabled:bg-gray-100 dark:disabled:bg-gray-800/70`}>
-            <option value="">{form.city ? 'Selecione o bairro…' : 'Escolha a cidade primeiro'}</option>
-            {cityNeighborhoods.map((neighborhood, index) => <option key={`${neighborhood.label}-${index}`} value={neighborhood.label}>{neighborhood.label}</option>)}
-          </select>
+          {isFreeTextCity ? (
+            <input required type="text" value={form.neighborhood} onChange={event => setField('neighborhood', event.target.value)} placeholder="Digite o bairro" className={inputClass} />
+          ) : (
+            <select required disabled={!form.city} value={form.neighborhood} onChange={event => setField('neighborhood', event.target.value)} className={`${inputClass} disabled:cursor-not-allowed disabled:bg-gray-100 dark:disabled:bg-gray-800/70`}>
+              <option value="">{form.city ? 'Selecione o bairro…' : 'Escolha a cidade primeiro'}</option>
+              {cityNeighborhoods.map((neighborhood, index) => <option key={`${neighborhood.label}-${index}`} value={neighborhood.label}>{neighborhood.label}</option>)}
+            </select>
+          )}
         </Field>
         <Field label="Taxa de Entrega">
           <div className={`${inputClass} flex items-center bg-gray-50 dark:bg-gray-800`}>
